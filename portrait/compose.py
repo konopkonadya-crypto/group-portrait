@@ -8,6 +8,7 @@ CROP_MARGIN = 60
 EDGE_BAND = 24
 FACE_RATIO = 1.2
 FACE_SHARE = 0.3
+SMART_EDGES = True
 
 
 def bbox_of(mask):
@@ -48,6 +49,58 @@ def refine_edge(rgb, mask, band=EDGE_BAND):
     refined = np.zeros_like(mask)
     refined[y0:y1, x0:x1] = np.isin(gc, (cv2.GC_FGD, cv2.GC_PR_FGD)).astype(np.uint8) * 255
     return refined if refined.any() else mask
+
+
+
+def smart_matte(rgb, mask, feather=12, iterations=3):
+    """Уточняет границу по содержимому снимка, учитывая волосы и края одежды.
+
+    Маска расширяется в неизвестную полосу, внутри полосы альфа считается по
+    близости цвета к переднему и заднему плану, затем сглаживается guided filter.
+    """
+    box = bbox_of(mask)
+    if box is None:
+        return mask
+    h, w = mask.shape
+    margin = max(12, int(feather) * 2)
+    x0, y0 = max(0, box[0] - margin), max(0, box[1] - margin)
+    x1, y1 = min(w, box[2] + margin), min(h, box[3] + margin)
+    crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    local = (mask[y0:y1, x0:x1] > 127).astype(np.uint8)
+
+    core = cv2.erode(local, np.ones((3, 3), np.uint8), iterations=1)
+    unknown = cv2.dilate(local, np.ones((margin * 2 + 1, margin * 2 + 1), np.uint8))
+    unknown = (unknown > 0) & (core == 0)
+    if core.sum() < 30 or unknown.sum() < 30:
+        return mask
+
+    lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
+    fg_mean = lab[core > 0].mean(axis=0)
+    bg_ring = cv2.dilate(local, np.ones((margin * 3 + 1, margin * 3 + 1), np.uint8))
+    bg_sel = (bg_ring > 0) & (local == 0)
+    if bg_sel.sum() < 30:
+        return mask
+    bg_mean = lab[bg_sel].mean(axis=0)
+
+    dfg = np.linalg.norm(lab - fg_mean, axis=2)
+    dbg = np.linalg.norm(lab - bg_mean, axis=2)
+    alpha = np.clip(dbg / (dfg + dbg + 1e-6), 0, 1)
+    for _ in range(max(1, iterations)):
+        alpha = cv2.GaussianBlur(alpha, (0, 0), max(1.0, margin / 3.0))
+
+    guided = alpha.astype(np.float32)
+    if hasattr(cv2, "ximgproc"):
+        try:
+            guided = cv2.ximgproc.guidedFilter(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY), guided.astype(np.float32),
+                                               max(4, margin), 1e-3)
+        except cv2.error:
+            pass
+
+    alpha = np.clip(guided, 0, 1)
+    alpha[core > 0] = 1.0
+    out = np.zeros((h, w), np.float32)
+    out[y0:y1, x0:x1] = alpha
+    return np.clip(out * 255, 0, 255).astype(np.uint8)
 
 
 def face_span(face):
@@ -194,6 +247,8 @@ class Layer:
         self.visible = True
         self.faces = faces
         self.aligned = aligned
+        self.name = "Слой"
+        self.erased = []
         self.origins = [self._origin_of(matrix) for mask, matrix in pieces]
         union = np.zeros(image.shape[:2], np.uint8)
         for mask, _ in pieces:
@@ -206,7 +261,9 @@ class Layer:
         return (0.0, 0.0)
 
     def params(self):
-        return {key: getattr(self, key) for key in ("dx", "dy", "scale", "angle", "feather", "color", "visible")}
+        data = {key: getattr(self, key) for key in ("dx", "dy", "scale", "angle", "feather", "color", "visible", "name")}
+        data["erased"] = len(self.erased)
+        return data
 
     def apply_params(self, params):
         for key, value in params.items():
@@ -231,6 +288,23 @@ class Layer:
         patch_mask = cv2.warpAffine(mask, shifted, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
         return patch, patch_mask, ox, oy
 
+    @staticmethod
+    def _apply_erase(patch_mask, erase, ox, oy):
+        ph, pw = patch_mask.shape
+        bh, bw = erase.shape
+        bx0, by0 = max(0, ox), max(0, oy)
+        bx1, by1 = min(bw, ox + pw), min(bh, oy + ph)
+        if bx1 <= bx0 or by1 <= by0:
+            return patch_mask
+        sub = erase[by0:by1, bx0:bx1]
+        if not (sub == 0).any():
+            return patch_mask
+        px0, py0 = bx0 - ox, by0 - oy
+        out = patch_mask.copy()
+        region = (out[py0:py0 + sub.shape[0], px0:px0 + sub.shape[1]].astype(np.float32) * sub / 255.0)
+        out[py0:py0 + sub.shape[0], px0:px0 + sub.shape[1]] = region.astype(np.uint8)
+        return out
+
     def _match_color(self, base, patch, patch_mask, ox, oy):
         bh, bw = base.shape[:2]
         ph, pw = patch.shape[:2]
@@ -247,11 +321,28 @@ class Layer:
         out[py0:py1, px0:px1] = matched
         return out
 
+    def erase(self, x, y, radius):
+        """Стирает часть слоя вокруг точки. Координаты — в системе основного снимка."""
+        self.erased.append((float(x), float(y), float(radius)))
+
+    def erase_mask(self, shape):
+        """Маска стёртого: 0 — стёрто, 255 — оставить."""
+        keep = np.full(shape, 255, np.uint8)
+        h, w = shape
+        for x, y, radius in self.erased:
+            xi, yi = int(round(x)), int(round(y))
+            if 0 <= xi < w and 0 <= yi < h:
+                cv2.circle(keep, (xi, yi), max(1, int(radius)), 0, -1)
+        return keep
+
     def apply(self, base, poisson=True):
         out = base
         used = "alpha"
+        erase = self.erase_mask(base.shape[:2]) if self.erased else None
         for mask, matrix in self.pieces:
             patch, patch_mask, ox, oy = self._warp(mask, matrix)
+            if erase is not None:
+                patch_mask = self._apply_erase(patch_mask, erase, ox, oy)
             if self.color > 0:
                 patch = self._match_color(out, patch, patch_mask, ox, oy)
             blended = _blend_poisson(out, patch, patch_mask, ox, oy) if poisson and self.mode == "poisson" else None
@@ -300,6 +391,8 @@ def build_layer(donor_rgb, selection, donor_faces, base_faces, base_point=None, 
         return layer
 
     parts = split_selection(selection, [face[NOSE_TIP] for face in chosen])
+    if SMART_EDGES:
+        parts = [smart_matte(donor_rgb, part, feather=feather) for part in parts]
     pieces, crop_shifts, aligned = [], [], 0
     crop = mask = origin = None
     for index, (part, face) in enumerate(zip(parts, chosen)):
