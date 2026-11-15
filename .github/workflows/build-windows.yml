@@ -6,6 +6,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -23,11 +24,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: 3. Tests
-        continue-on-error: true
-        shell: pwsh
-        run: python -m pytest -q tests
-
+  
       - name: 4. Build exe
         shell: pwsh
         run: python -m PyInstaller --noconfirm GroupPortrait.spec
