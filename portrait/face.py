@@ -6,7 +6,8 @@ from mediapipe.tasks.python import vision
 
 from .paths import resource
 
-ANCHORS = [33, 263, 133, 362, 1, 61, 291, 152, 10]
+ANCHORS = [33, 263, 133, 362, 1, 61, 291, 152, 10,
+           159, 386, 145, 374, 70, 300, 105, 334, 199, 234, 454, 127, 356]
 NOSE_TIP = 1
 DETECT_SIDE = 1600
 TILE_MIN = 640

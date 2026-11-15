@@ -1,14 +1,12 @@
 import cv2
 import numpy as np
 
-from .color import transfer
 from .face import ANCHORS, NOSE_TIP
 
 CROP_MARGIN = 60
 EDGE_BAND = 24
 FACE_RATIO = 1.2
 FACE_SHARE = 0.3
-SMART_EDGES = True
 
 
 def bbox_of(mask):
@@ -34,13 +32,13 @@ def refine_edge(rgb, mask, band=EDGE_BAND):
     x1, y1 = min(w, box[2] + band), min(h, box[3] + band)
     crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
     local = mask[y0:y1, x0:x1]
-    band_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1, 2 * band + 1))
-    near = cv2.dilate(local, band_kernel)
-    sure_fg = cv2.erode(local, np.ones((5, 5), np.uint8))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1, 2 * band + 1))
+    near = cv2.dilate(local, kernel)
+    sure = cv2.erode(local, np.ones((5, 5), np.uint8))
     gc = np.full(local.shape, cv2.GC_BGD, np.uint8)
     gc[near > 0] = cv2.GC_PR_BGD
     gc[local > 0] = cv2.GC_PR_FGD
-    gc[sure_fg > 0] = cv2.GC_FGD
+    gc[sure > 0] = cv2.GC_FGD
     bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
     try:
         cv2.grabCut(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), gc, None, bgd, fgd, 4, cv2.GC_INIT_WITH_MASK)
@@ -51,13 +49,38 @@ def refine_edge(rgb, mask, band=EDGE_BAND):
     return refined if refined.any() else mask
 
 
+def _lab(rgb):
+    return cv2.cvtColor(rgb.astype(np.float32) / 255.0, cv2.COLOR_RGB2LAB)
+
+
+def _from_lab(lab):
+    out = cv2.cvtColor(lab.astype(np.float32), cv2.COLOR_LAB2RGB) * 255.0
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def harmonize(patch, base_region, patch_mask, strength=1.0, ring=None):
+    """Подгоняет цвет и свет патча под участок, на который он ляжет."""
+    strength = float(np.clip(strength, 0.0, 1.0))
+    inside = patch_mask > 127
+    if strength <= 0 or inside.sum() < 20 or base_region.shape[:2] != patch.shape[:2]:
+        return patch
+
+    src = _lab(patch)
+    dst = _lab(base_region)
+    out = src.copy()
+    for channel in range(3):
+        s = src[..., channel][inside]
+        d = dst[..., channel][inside]
+        mean_s, std_s = float(s.mean()), float(s.std())
+        mean_d, std_d = float(d.mean()), float(d.std())
+        ratio = 1.0 if std_s < 1e-3 else float(np.clip(std_d / std_s, 0.85, 1.18))
+        adjusted = (src[..., channel] - mean_s) * ratio + mean_d
+        out[..., channel] = src[..., channel] + strength * (adjusted - src[..., channel])
+    return _from_lab(out)
+
 
 def smart_matte(rgb, mask, feather=12, iterations=3):
-    """Уточняет границу по содержимому снимка, учитывая волосы и края одежды.
-
-    Маска расширяется в неизвестную полосу, внутри полосы альфа считается по
-    близости цвета к переднему и заднему плану, затем сглаживается guided filter.
-    """
+    """Уточняет границу по содержимому снимка: волосы, одежда, края."""
     box = bbox_of(mask)
     if box is None:
         return mask
@@ -71,14 +94,14 @@ def smart_matte(rgb, mask, feather=12, iterations=3):
     core = cv2.erode(local, np.ones((3, 3), np.uint8), iterations=1)
     unknown = cv2.dilate(local, np.ones((margin * 2 + 1, margin * 2 + 1), np.uint8))
     unknown = (unknown > 0) & (core == 0)
-    if core.sum() < 30 or unknown.sum() < 30:
+    if int(core.sum()) < 30 or int(unknown.sum()) < 30:
         return mask
 
     lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
     fg_mean = lab[core > 0].mean(axis=0)
-    bg_ring = cv2.dilate(local, np.ones((margin * 3 + 1, margin * 3 + 1), np.uint8))
-    bg_sel = (bg_ring > 0) & (local == 0)
-    if bg_sel.sum() < 30:
+    far = cv2.dilate(local, np.ones((margin * 3 + 1, margin * 3 + 1), np.uint8))
+    bg_sel = (far > 0) & (local == 0)
+    if int(bg_sel.sum()) < 30:
         return mask
     bg_mean = lab[bg_sel].mean(axis=0)
 
@@ -91,8 +114,9 @@ def smart_matte(rgb, mask, feather=12, iterations=3):
     guided = alpha.astype(np.float32)
     if hasattr(cv2, "ximgproc"):
         try:
-            guided = cv2.ximgproc.guidedFilter(cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY), guided.astype(np.float32),
-                                               max(4, margin), 1e-3)
+            guided = cv2.ximgproc.guidedFilter(
+                cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY), guided, max(4, margin), 1e-3
+            )
         except cv2.error:
             pass
 
@@ -119,9 +143,17 @@ def share_inside(face, mask):
 def estimate_alignment(donor_face, base_face):
     src = np.float64(donor_face[ANCHORS])
     dst = np.float64(base_face[ANCHORS])
-    matrix, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0)
-    if matrix is None or inliers is None or int(inliers.sum()) < 5:
+    matrix, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0)
+    if matrix is None or not np.isfinite(matrix).all():
         return None
+    # Часть точек на групповых снимках всегда выбросы: достаточно трети совпадений.
+    need = max(4, len(ANCHORS) // 4)
+    if inliers is None or int(inliers.sum()) < need:
+        # Если совсем не сошлось — пробуем обычный МНК без отсева.
+        plain, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)
+        if plain is None or not np.isfinite(plain).all():
+            return None
+        return plain
     return matrix
 
 
@@ -130,7 +162,6 @@ def _mul(a, b):
 
 
 def _order_match(chosen, work_faces):
-    """Запасное сопоставление: слева направо по относительному положению в кадре."""
     order_donor = sorted(range(len(chosen)), key=lambda i: chosen[i][NOSE_TIP][0])
     order_work = sorted(range(len(work_faces)), key=lambda j: work_faces[j][NOSE_TIP][0])
     matches = {}
@@ -141,11 +172,9 @@ def _order_match(chosen, work_faces):
 
 
 def plan_faces(selection, donor_faces, work_faces, offset):
-    """Лица донора внутри выделения и их пары с лицами рабочего снимка, без повторов."""
-    chosen = [face for face in donor_faces if share_inside(face, selection) >= FACE_SHARE]
+    chosen = [f for f in donor_faces if share_inside(f, selection) >= FACE_SHARE]
     if not chosen or not work_faces:
         return chosen, {}
-
     pairs = []
     for i, face in enumerate(chosen):
         guess = face[NOSE_TIP] + np.asarray(offset, np.float64)
@@ -159,11 +188,8 @@ def plan_faces(selection, donor_faces, work_faces, offset):
             continue
         matches[i] = j
         used.add(j)
-
-    # Если кто-то остался без пары, добираем по порядку слева направо.
     if len(matches) < len(chosen):
-        spare = {i: j for i, j in _order_match(chosen, work_faces).items()
-                 if i not in matches and j not in used}
+        spare = {i: j for i, j in _order_match(chosen, work_faces).items() if i not in matches and j not in used}
         for i, j in spare.items():
             matches[i] = j
             used.add(j)
@@ -171,18 +197,18 @@ def plan_faces(selection, donor_faces, work_faces, offset):
 
 
 def split_selection(selection, centers):
-    """Делит выделение между лицами: каждый пиксель достаётся ближайшему лицу."""
     if len(centers) <= 1:
         return [selection]
-    ys, xs = np.nonzero(selection)
+    ys, xs = np.nonzero(selection > 127)
+    if len(xs) == 0:
+        return [selection]
     pts = np.stack([xs, ys], axis=1).astype(np.float32)
     dist = np.stack([np.linalg.norm(pts - np.asarray(c, np.float32), axis=1) for c in centers], axis=1)
     label = dist.argmin(axis=1)
     parts = []
     for k in range(len(centers)):
         part = np.zeros_like(selection)
-        chosen = label == k
-        part[ys[chosen], xs[chosen]] = 255
+        part[ys[label == k], xs[label == k]] = 255
         parts.append(part)
     return parts
 
@@ -232,7 +258,7 @@ def _blend_alpha(base, patch, alpha, ox, oy):
 
 
 class Layer:
-    """Перенесённое выделение. Состоит из кусков, у каждого свой сдвиг и выравнивание."""
+    """Перенесённый фрагмент: куски со своим выравниванием, ластик и имя."""
 
     def __init__(self, image, pieces, feather=12, mode="poisson", faces=0, aligned=0):
         self.image = image
@@ -249,25 +275,35 @@ class Layer:
         self.aligned = aligned
         self.name = "Слой"
         self.erased = []
-        self.origins = [self._origin_of(matrix) for mask, matrix in pieces]
+        self.origins = []
         union = np.zeros(image.shape[:2], np.uint8)
         for mask, _ in pieces:
-            union |= mask
+            union |= (mask > 127).astype(np.uint8) * 255
         ys, xs = np.nonzero(union)
         self.pivot = (float(xs.mean()), float(ys.mean())) if len(xs) else (image.shape[1] / 2.0, image.shape[0] / 2.0)
 
-    @staticmethod
-    def _origin_of(matrix):
-        return (0.0, 0.0)
-
     def params(self):
-        data = {key: getattr(self, key) for key in ("dx", "dy", "scale", "angle", "feather", "color", "visible", "name")}
+        data = {k: getattr(self, k) for k in ("dx", "dy", "scale", "angle", "feather", "color", "visible")}
         data["erased"] = len(self.erased)
         return data
 
     def apply_params(self, params):
         for key, value in params.items():
+            if key == "erased":
+                continue
             setattr(self, key, value)
+
+    def erase(self, x, y, radius):
+        self.erased.append((float(x), float(y), float(radius)))
+
+    def erase_mask(self, shape):
+        keep = np.full(shape, 255, np.uint8)
+        h, w = shape
+        for x, y, radius in self.erased:
+            xi, yi = int(round(x)), int(round(y))
+            if 0 <= xi < w and 0 <= yi < h:
+                cv2.circle(keep, (xi, yi), max(1, int(radius)), 0, -1)
+        return keep
 
     def _full(self, matrix):
         rot = cv2.getRotationMatrix2D(self.pivot, self.angle, self.scale)
@@ -301,7 +337,7 @@ class Layer:
             return patch_mask
         px0, py0 = bx0 - ox, by0 - oy
         out = patch_mask.copy()
-        region = (out[py0:py0 + sub.shape[0], px0:px0 + sub.shape[1]].astype(np.float32) * sub / 255.0)
+        region = out[py0:py0 + sub.shape[0], px0:px0 + sub.shape[1]].astype(np.float32) * sub / 255.0
         out[py0:py0 + sub.shape[0], px0:px0 + sub.shape[1]] = region.astype(np.uint8)
         return out
 
@@ -314,26 +350,12 @@ class Layer:
             return patch
         px0, py0 = bx0 - ox, by0 - oy
         px1, py1 = px0 + (bx1 - bx0), py0 + (by1 - by0)
-        matched = transfer(
+        matched = harmonize(
             patch[py0:py1, px0:px1], base[by0:by1, bx0:bx1], patch_mask[py0:py1, px0:px1], self.color
         )
         out = patch.copy()
         out[py0:py1, px0:px1] = matched
         return out
-
-    def erase(self, x, y, radius):
-        """Стирает часть слоя вокруг точки. Координаты — в системе основного снимка."""
-        self.erased.append((float(x), float(y), float(radius)))
-
-    def erase_mask(self, shape):
-        """Маска стёртого: 0 — стёрто, 255 — оставить."""
-        keep = np.full(shape, 255, np.uint8)
-        h, w = shape
-        for x, y, radius in self.erased:
-            xi, yi = int(round(x)), int(round(y))
-            if 0 <= xi < w and 0 <= yi < h:
-                cv2.circle(keep, (xi, yi), max(1, int(radius)), 0, -1)
-        return keep
 
     def apply(self, base, poisson=True):
         out = base
@@ -343,9 +365,11 @@ class Layer:
             patch, patch_mask, ox, oy = self._warp(mask, matrix)
             if erase is not None:
                 patch_mask = self._apply_erase(patch_mask, erase, ox, oy)
+            if not (patch_mask > 127).any():
+                continue
             if self.color > 0:
                 patch = self._match_color(out, patch, patch_mask, ox, oy)
-            blended = _blend_poisson(out, patch, patch_mask, ox, oy) if poisson and self.mode == "poisson" else None
+            blended = _blend_poisson(out, patch, patch_mask, ox, oy) if poisson else None
             if blended is not None:
                 out = blended
                 used = "poisson"
@@ -355,7 +379,6 @@ class Layer:
 
 
 def _crop(donor_rgb, selection):
-    """Вырезает участок вокруг выделения. Возвращает ещё и сдвиг кропа."""
     box = bbox_of(selection)
     if box is None:
         return None
@@ -365,55 +388,53 @@ def _crop(donor_rgb, selection):
     crop = np.ascontiguousarray(donor_rgb[y0:y1, x0:x1])
     mask = np.ascontiguousarray(selection[y0:y1, x0:x1])
     origin = np.array([[1.0, 0.0, float(x0)], [0.0, 1.0, float(y0)]])
-    return crop, mask, origin, (x0, y0)
+    return crop, mask, origin
 
 
 def build_layer(donor_rgb, selection, donor_faces, base_faces, base_point=None, feather=12, mode="poisson"):
-    """Один слой на всё выделение. Если внутри несколько лиц, каждое уходит на своё лицо рабочего снимка."""
-    if bbox_of(selection) is None:
-        return None
+    """Один слой на выделение. Несколько лиц — каждое на своё место рабочего снимка."""
     box = bbox_of(selection)
+    if box is None:
+        return None
     cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
     drop = np.array(base_point, np.float64) if base_point is not None else np.array([cx, cy], np.float64)
     offset = drop - np.array([cx, cy], np.float64)
 
-    # Лица ищем по исходному выделению: координаты лиц тоже в системе донора.
     chosen, matches = plan_faces(selection, donor_faces, base_faces, offset)
 
     if not chosen:
         cropped = _crop(donor_rgb, selection)
         if cropped is None:
             return None
-        crop, mask, origin, _ = cropped
+        crop, mask, origin = cropped
         shift = _mul(origin, np.array([[1.0, 0.0, offset[0]], [0.0, 1.0, offset[1]]]))
         layer = Layer(crop, [(mask, shift)], feather=feather, mode=mode, faces=0, aligned=0)
-        layer.origins = [(origin[0, 2], origin[1, 2])]
+        layer.origins = [(float(origin[0, 2]), float(origin[1, 2]))]
         return layer
 
-    parts = split_selection(selection, [face[NOSE_TIP] for face in chosen])
-    if SMART_EDGES:
-        parts = [smart_matte(donor_rgb, part, feather=feather) for part in parts]
-    pieces, crop_shifts, aligned = [], [], 0
-    crop = mask = origin = None
+    parts = split_selection(selection, [f[NOSE_TIP] for f in chosen])
+    parts = [smart_matte(donor_rgb, part, feather=feather) for part in parts]
+
+    pieces, origins, aligned = [], [], 0
+    crop = None
     for index, (part, face) in enumerate(zip(parts, chosen)):
         cropped = _crop(donor_rgb, part)
         if cropped is None:
             continue
-        crop_i, mask_i, origin_i, _ = cropped
+        crop_i, mask_i, origin_i = cropped
+        origins.append((float(origin_i[0, 2]), float(origin_i[1, 2])))
         if crop is None:
-            crop, origin = crop_i, origin_i
-        target_index = matches.get(index)
-        matrix = estimate_alignment(face, base_faces[target_index]) if target_index is not None else None
+            crop = crop_i
+        target = matches.get(index)
+        matrix = estimate_alignment(face, base_faces[target]) if target is not None else None
         if matrix is not None:
             aligned += 1
             pieces.append((mask_i, _mul(matrix, origin_i)))
-            crop_shifts.append((origin_i[0, 2], origin_i[1, 2]))
         else:
             guess = _mul(origin_i, np.array([[1.0, 0.0, offset[0]], [0.0, 1.0, offset[1]]]))
             pieces.append((mask_i, guess))
-            crop_shifts.append((origin_i[0, 2], origin_i[1, 2]))
     if not pieces:
         return None
     layer = Layer(crop, pieces, feather=feather, mode=mode, faces=len(chosen), aligned=aligned)
-    layer.origins = crop_shifts
+    layer.origins = origins
     return layer
